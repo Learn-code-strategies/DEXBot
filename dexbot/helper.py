@@ -35,14 +35,32 @@ def remove(path):
 
 def truncate(number, decimals):
     """ Change the decimal point of a number without rounding
+
+        :param float | number: A float number to be cut down
+        :param int | decimals: Number of decimals to be left to the float number
+        :return: Price with specified precision
     """
     return math.floor(number * 10 ** decimals) / 10 ** decimals
+
+
+def get_user_data_directory():
+    """ Returns the user data directory path which contains history, sql and logs
+    """
+    return user_data_dir(APP_NAME, AUTHOR)
+
+
+def initialize_data_folders():
+    """ Creates folders for strategies to store files """
+    user_data_directory = get_user_data_directory()
+    mkdir(os.path.join(user_data_directory, 'graphs'))
+    mkdir(os.path.join(user_data_directory, 'data'))
+    mkdir(os.path.join(user_data_directory, 'logs'))
 
 
 def initialize_orders_log():
     """ Creates .csv log file, adds the headers first time only
     """
-    data_dir = user_data_dir(APP_NAME, AUTHOR)
+    data_dir = get_user_data_directory()
     filename = os.path.join(data_dir, 'history.csv')
     file = os.path.isfile(filename)
 

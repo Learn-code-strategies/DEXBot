@@ -15,11 +15,10 @@ class CreateWorkerView(QtWidgets.QDialog, Ui_Dialog):
         self.setupUi(self)
 
         # Todo: Using a model here would be more Qt like
-        # Populate the comboboxes
+        # Populate the combobox
         strategies = self.controller.strategies
         for strategy in strategies:
             self.strategy_input.addItem(strategies[strategy]['name'], strategy)
-        self.base_asset_input.addItems(self.controller.base_assets)
 
         # Generate a name for the worker
         self.worker_name = controller.get_unique_worker_name()

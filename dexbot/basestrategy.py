@@ -194,6 +194,12 @@ class BaseStrategy(Storage, StateMachine, Events):
         # Order expiration time in seconds
         self.expiration = 60 * 60 * 24 * 365 * 5
 
+        # buy/sell actions will return order id by default
+        self.returnOrderId = 'head'
+
+        # CER cache
+        self.core_exchange_rate = None
+
         # A private logger that adds worker identify data to the LogRecord
         self.log = logging.LoggerAdapter(
             logging.getLogger('dexbot.per_worker'),
@@ -211,7 +217,7 @@ class BaseStrategy(Storage, StateMachine, Events):
         ticker = self.market.ticker()
         highest_bid = ticker.get("highestBid")
         lowest_ask = ticker.get("lowestAsk")
-        if not float(highest_bid):
+        if highest_bid is None or highest_bid == 0.0:
             if not suppress_errors:
                 self.log.critical(
                     "Cannot estimate center price, there is no highest bid."
@@ -280,7 +286,7 @@ class BaseStrategy(Storage, StateMachine, Events):
 
     @property
     def all_orders(self):
-        """ Return the worker's open accounts in all markets
+        """ Return the accounts's open orders in all markets
         """
         self.account.refresh()
         return [o for o in self.account.openorders]
@@ -298,7 +304,7 @@ class BaseStrategy(Storage, StateMachine, Events):
 
         # Find buy orders
         for order in orders:
-            if not self.is_sell_order(order):
+            if self.is_buy_order(order):
                 buy_orders.append(order)
         if sort:
             buy_orders = self.sort_orders(buy_orders, sort)
@@ -326,10 +332,19 @@ class BaseStrategy(Storage, StateMachine, Events):
 
         return sell_orders
 
-    def is_sell_order(self, order):
-        """ Checks if the order is Sell order. Returns False if Buy order
+    def is_buy_order(self, order):
+        """ Checks if the order is Buy order
             :param order: Buy / Sell order
-            :return: bool: True = Sell order, False = Buy order
+            :return: bool: True = Buy order
+        """
+        if order['base']['symbol'] == self.market['base']['symbol']:
+            return True
+        return False
+
+    def is_sell_order(self, order):
+        """ Checks if the order is Sell order
+            :param order: Buy / Sell order
+            :return: bool: True = Sell order
         """
         if order['base']['symbol'] != self.market['base']['symbol']:
             return True
@@ -342,15 +357,37 @@ class BaseStrategy(Storage, StateMachine, Events):
             :param str sort: ASC or DESC. Default DESC
             :return list: Sorted list of orders.
         """
-        if sort.upper() == 'ASC':
+        if sort == 'ASC':
             reverse = False
-        elif sort.upper() == 'DESC':
+        elif sort == 'DESC':
             reverse = True
         else:
             return None
 
         # Sort orders by price
         return sorted(orders, key=lambda order: order['price'], reverse=reverse)
+
+    def get_order_cancellation_fee(self, fee_asset):
+        """ Returns the order cancellation fee in the specified asset.
+
+            :param string | fee_asset: Asset in which the fee is wanted
+            :return: Cancellation fee as fee asset
+        """
+        # Get fee
+        fees = self.dex.returnFees()
+        limit_order_cancel = fees['limit_order_cancel']
+        return self.convert_fee(limit_order_cancel['fee'], fee_asset)
+
+    def get_order_creation_fee(self, fee_asset):
+        """ Returns the cost of creating an order in the asset specified
+
+            :param fee_asset: QUOTE, BASE, BTS, or any other
+            :return:
+        """
+        # Get fee
+        fees = self.dex.returnFees()
+        limit_order_create = fees['limit_order_create']
+        return self.convert_fee(limit_order_create['fee'], fee_asset)
 
     @staticmethod
     def get_order(order_id, return_none=True):
@@ -389,6 +426,10 @@ class BaseStrategy(Storage, StateMachine, Events):
         else:
             return order
 
+        # Do not try to continue whether there is no order in the blockchain
+        if not order:
+            return None
+
         order = self.get_updated_limit_order(order)
         return Order(order, bitshares_instance=self.bitshares)
 
@@ -421,8 +462,8 @@ class BaseStrategy(Storage, StateMachine, Events):
             :return: dict
         """
         o = copy.deepcopy(limit_order)
-        price = o['sell_price']['base']['amount'] / o['sell_price']['quote']['amount']
-        base_amount = o['for_sale']
+        price = float(o['sell_price']['base']['amount']) / float(o['sell_price']['quote']['amount'])
+        base_amount = float(o['for_sale'])
         quote_amount = base_amount / price
         o['sell_price']['base']['amount'] = base_amount
         o['sell_price']['quote']['amount'] = quote_amount
@@ -492,8 +533,10 @@ class BaseStrategy(Storage, StateMachine, Events):
 
         return True
 
-    def cancel(self, orders):
+    def cancel(self, orders, batch_only=False):
         """ Cancel specific order(s)
+            :param list orders: list of orders to cancel
+            :param bool batch_only: try cancel orders only in batch mode without one-by-one fallback
         """
         if not isinstance(orders, (list, set, tuple)):
             orders = [orders]
@@ -501,10 +544,13 @@ class BaseStrategy(Storage, StateMachine, Events):
         orders = [order['id'] for order in orders if 'id' in order]
 
         success = self._cancel(orders)
-        if not success and len(orders) > 1:
+        if not success and batch_only:
+            return False
+        if not success and len(orders) > 1 and not batch_only:
             # One of the order cancels failed, cancel the orders one by one
             for order in orders:
                 self._cancel(order)
+        return True
 
     def cancel_all(self):
         """ Cancel all orders of the worker's account
@@ -521,10 +567,10 @@ class BaseStrategy(Storage, StateMachine, Events):
         self.cancel_all()
         self.clear_orders()
 
-    def market_buy(self, amount, price, return_none=False, *args, **kwargs):
+    def market_buy(self, quote_amount, price, return_none=False, *args, **kwargs):
         symbol = self.market['base']['symbol']
         precision = self.market['base']['precision']
-        base_amount = truncate(price * amount, precision)
+        base_amount = truncate(price * quote_amount, precision)
 
         # Don't try to place an order of size 0
         if not base_amount:
@@ -533,7 +579,7 @@ class BaseStrategy(Storage, StateMachine, Events):
             return None
 
         # Make sure we have enough balance for the order
-        if self.balance(self.market['base']) < base_amount:
+        if self.returnOrderId and self.balance(self.market['base']) < base_amount:
             self.log.critical(
                 "Insufficient buy balance, needed {} {}".format(
                     base_amount, symbol)
@@ -542,37 +588,40 @@ class BaseStrategy(Storage, StateMachine, Events):
             return None
 
         self.log.info(
-            'Placing a buy order for {} {} @ {}'.format(
-                base_amount, symbol, round(price, 8))
+            'Placing a buy order for {:.{prec}} {} @ {:.8f}'.format(
+                base_amount, symbol, price, prec=precision)
         )
 
         # Place the order
         buy_transaction = self.retry_action(
             self.market.buy,
             price,
-            Amount(amount=amount, asset=self.market["quote"]),
+            Amount(amount=quote_amount, asset=self.market["quote"]),
             account=self.account.name,
             expiration=self.expiration,
-            returnOrderId="head",
+            returnOrderId=self.returnOrderId,
             fee_asset=self.fee_asset['id'],
             *args,
             **kwargs
         )
 
         self.log.debug('Placed buy order {}'.format(buy_transaction))
-        buy_order = self.get_order(buy_transaction['orderid'], return_none=return_none)
-        if buy_order and buy_order['deleted']:
-            # The API doesn't return data on orders that don't exist
-            # We need to calculate the data on our own
-            buy_order = self.calculate_order_data(buy_order, amount, price)
-            self.recheck_orders = True
 
-        return buy_order
+        if self.returnOrderId:
+            buy_order = self.get_order(buy_transaction['orderid'], return_none=return_none)
+            if buy_order and buy_order['deleted']:
+                # The API doesn't return data on orders that don't exist
+                # We need to calculate the data on our own
+                buy_order = self.calculate_order_data(buy_order, quote_amount, price)
+                self.recheck_orders = True
+            return buy_order
+        else:
+            return True
 
-    def market_sell(self, amount, price, return_none=False, *args, **kwargs):
+    def market_sell(self, quote_amount, price, return_none=False, *args, **kwargs):
         symbol = self.market['quote']['symbol']
         precision = self.market['quote']['precision']
-        quote_amount = truncate(amount, precision)
+        quote_amount = truncate(quote_amount, precision)
 
         # Don't try to place an order of size 0
         if not quote_amount:
@@ -581,42 +630,44 @@ class BaseStrategy(Storage, StateMachine, Events):
             return None
 
         # Make sure we have enough balance for the order
-        if self.balance(self.market['quote']) < quote_amount:
+        if self.returnOrderId and self.balance(self.market['quote']) < quote_amount:
             self.log.critical(
                 "Insufficient sell balance, needed {} {}".format(
-                    amount, symbol)
+                    quote_amount, symbol)
             )
             self.disabled = True
             return None
 
         self.log.info(
-            'Placing a sell order for {} {} @ {}'.format(
-                quote_amount, symbol, round(price, 8))
+            'Placing a sell order for {:.{prec}f} {} @ {:.8f}'.format(
+                quote_amount, symbol, price, prec=precision)
         )
 
         # Place the order
         sell_transaction = self.retry_action(
             self.market.sell,
             price,
-            Amount(amount=amount, asset=self.market["quote"]),
+            Amount(amount=quote_amount, asset=self.market["quote"]),
             account=self.account.name,
             expiration=self.expiration,
-            returnOrderId="head",
+            returnOrderId=self.returnOrderId,
             fee_asset=self.fee_asset['id'],
             *args,
             **kwargs
         )
 
         self.log.debug('Placed sell order {}'.format(sell_transaction))
-        sell_order = self.get_order(sell_transaction['orderid'], return_none=return_none)
-        if sell_order and sell_order['deleted']:
-            # The API doesn't return data on orders that don't exist
-            # We need to calculate the data on our own
-            sell_order = self.calculate_order_data(sell_order, amount, price)
-            sell_order.invert()
-            self.recheck_orders = True
-
-        return sell_order
+        if self.returnOrderId:
+            sell_order = self.get_order(sell_transaction['orderid'], return_none=return_none)
+            if sell_order and sell_order['deleted']:
+                # The API doesn't return data on orders that don't exist
+                # We need to calculate the data on our own
+                sell_order = self.calculate_order_data(sell_order, quote_amount, price)
+                sell_order.invert()
+                self.recheck_orders = True
+            return sell_order
+        else:
+            return True
 
     def calculate_order_data(self, order, amount, price):
         quote_asset = Amount(amount, self.market['quote']['symbol'])
@@ -648,6 +699,7 @@ class BaseStrategy(Storage, StateMachine, Events):
 
     @staticmethod
     def purge_worker_data(worker_name):
+        """ Remove worker data from database only """
         Storage.clear_worker_data(worker_name)
 
     def total_balance(self, order_ids=None, return_asset=False):
@@ -718,7 +770,7 @@ class BaseStrategy(Storage, StateMachine, Events):
 
     @staticmethod
     def convert_asset(from_value, from_asset, to_asset):
-        """ Converts asset to another based on the latest market value
+        """Converts asset to another based on the latest market value
             :param from_value: Amount of the input asset
             :param from_asset: Symbol of the input asset
             :param to_asset: Symbol of the output asset
@@ -728,6 +780,26 @@ class BaseStrategy(Storage, StateMachine, Events):
         ticker = market.ticker()
         latest_price = ticker.get('latest', {}).get('price', None)
         return from_value * latest_price
+
+    def convert_fee(self, fee_amount, fee_asset):
+        """ Convert fee amount in BTS to fee in fee_asset
+
+            :param float | fee_amount: fee amount paid in BTS
+            :param Asset | fee_asset: fee asset to pay fee in
+            :return: float | amount of fee_asset to pay fee
+        """
+        if isinstance(fee_asset, str):
+            fee_asset = Asset(fee_asset)
+
+        if fee_asset['id'] == '1.3.0':
+            # Fee asset is BTS, so no further calculations are needed
+            return fee_amount
+        else:
+            if not self.core_exchange_rate:
+                # Determine how many fee_asset is needed for core-exchange
+                temp_market = Market(base=fee_asset, quote=Asset('1.3.0'))
+                self.core_exchange_rate = temp_market.ticker()['core_exchange_rate']
+            return fee_amount * self.core_exchange_rate['base']['amount']
 
     def orders_balance(self, order_ids, return_asset=False):
         if not order_ids:

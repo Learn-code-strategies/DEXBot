@@ -12,6 +12,7 @@ import bitshares
 from bitshares.instance import shared_bitshares_instance
 from bitshares.asset import Asset
 from bitshares.account import Account
+from bitshares.exceptions import KeyAlreadyInStoreException
 from bitsharesbase.account import PrivateKey
 from PyQt5 import QtGui
 
@@ -25,14 +26,22 @@ class WorkerController:
 
     @property
     def strategies(self):
+        """ Defines strategies that are configurable from the GUI.
+
+            key: Strategy location in the project
+            name: The name that is shown in the GUI for user
+            form_module: If there is custom form module created with QTDesigner
+
+            :return: List of strategies
+        """
         strategies = collections.OrderedDict()
         strategies['dexbot.strategies.relative_orders'] = {
             'name': 'Relative Orders',
-            'form_module': ''
+            'form_module': 'dexbot.views.ui.forms.relative_orders_widget_ui'
         }
         strategies['dexbot.strategies.staggered_orders'] = {
             'name': 'Staggered Orders',
-            'form_module': 'dexbot.views.ui.forms.staggered_orders_widget_ui'
+            'form_module': ''
         }
         for desc, module in find_external_strategies():
             strategies[module] = {'name': desc, 'form_module': module}
@@ -45,18 +54,11 @@ class WorkerController:
         """
         return cls(None, None, None).strategies
 
-    @property
-    def base_assets(self):
-        assets = [
-            'USD', 'OPEN.BTC', 'CNY', 'BTS', 'BTC'
-        ]
-        return assets
-
     def add_private_key(self, private_key):
         wallet = self.bitshares.wallet
         try:
             wallet.addPrivateKey(private_key)
-        except ValueError:
+        except KeyAlreadyInStoreException:
             # Private key already added
             pass
 
@@ -77,6 +79,14 @@ class WorkerController:
     @staticmethod
     def get_strategy_module(worker_data):
         return worker_data['module']
+
+    @staticmethod
+    def get_strategy_mode(worker_data):
+        return worker_data['mode']
+
+    @staticmethod
+    def get_allow_instant_fill(worder_data):
+        return worder_data['allow_instant_fill']
 
     @staticmethod
     def get_assets(worker_data):
@@ -169,7 +179,7 @@ class WorkerController:
         account = Account(account)
         pubkey = format(PrivateKey(private_key).pubkey, self.bitshares.prefix)
         key_type = self.bitshares.wallet.getKeyType(account, pubkey)
-        if key_type != 'active':
+        if key_type != 'active' and key_type != 'owner':
             return False
         return True
 
@@ -184,7 +194,7 @@ class WorkerController:
     @gui_error
     def validate_form(self):
         error_texts = []
-        base_asset = self.view.base_asset_input.currentText()
+        base_asset = self.view.base_asset_input.text()
         quote_asset = self.view.quote_asset_input.text()
         fee_asset = self.view.fee_asset_input.text()
         worker_name = self.view.worker_name_input.text()
@@ -231,6 +241,7 @@ class WorkerController:
         if self.mode == 'add':
             # Add the private key to the database
             private_key = self.view.private_key_input.text()
+
             if private_key:
                 self.add_private_key(private_key)
 
@@ -238,7 +249,7 @@ class WorkerController:
         else:  # Edit
             account = self.view.account_name.text()
 
-        base_asset = self.view.base_asset_input.currentText()
+        base_asset = self.view.base_asset_input.text()
         quote_asset = self.view.quote_asset_input.text()
         fee_asset = self.view.fee_asset_input.text()
         strategy_module = self.view.strategy_input.currentData()
